@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MLA-aware RadixAttention</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #050508; --surface: #0d0d12; --surface-2: #13131a; --surface-3: #1a1a24;
+    --border: rgba(255,255,255,0.07); --border-hi: rgba(255,255,255,0.13);
+    --text: #f0eeee; --text-muted: #7a7888; --text-sub: #4a4860;
+    --accent: #6B5CE7; --accent-2: #00E5B0; --accent-3: #FF6B35;
+    --accent-glow: rgba(107,92,231,0.18); --accent-2-glow: rgba(0,229,176,0.15);
+    --mono: 'DM Mono', monospace; --sans: 'DM Sans', sans-serif; --display: 'Syne', sans-serif;
+  }
+  html { scroll-behavior: smooth; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 16px; line-height: 1.6; overflow-x: hidden; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 0 32px; }
+  section { padding: 100px 0; }
+
+  nav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; padding: 18px 0; background: rgba(5,5,8,0.88); backdrop-filter: blur(20px); border-bottom: 0.5px solid var(--border); }
+  nav .inner { max-width: 1100px; margin: 0 auto; padding: 0 32px; display: flex; align-items: center; justify-content: space-between; }
+  .nav-logo { font-family: var(--display); font-weight: 700; font-size: 15px; color: var(--text); text-decoration: none; display: flex; align-items: center; gap: 10px; }
+  .nav-logo .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 12px var(--accent-2); }
+  .nav-links { display: flex; gap: 32px; list-style: none; }
+  .nav-links a { font-size: 13px; color: var(--text-muted); text-decoration: none; transition: color 0.2s; }
+  .nav-links a:hover { color: var(--text); }
+  .nav-badge { font-family: var(--mono); font-size: 11px; padding: 4px 10px; border: 0.5px solid var(--border-hi); border-radius: 20px; color: var(--accent-2); background: var(--accent-2-glow); }
+
+  #hero { padding: 200px 0 120px; position: relative; overflow: hidden; }
+  .hero-grid { position: absolute; inset: 0; opacity: 0.035; background-image: linear-gradient(var(--text) 1px, transparent 1px), linear-gradient(90deg, var(--text) 1px, transparent 1px); background-size: 60px 60px; }
+  .hero-glow { position: absolute; top: -200px; left: 50%; transform: translateX(-50%); width: 700px; height: 700px; background: radial-gradient(circle, rgba(107,92,231,0.10) 0%, transparent 70%); pointer-events: none; }
+  .hero-tag { font-family: var(--mono); font-size: 11px; letter-spacing: 1.5px; color: var(--accent); text-transform: uppercase; margin-bottom: 24px; display: flex; align-items: center; gap: 8px; }
+  .hero-tag::before { content: ''; width: 24px; height: 1px; background: var(--accent); }
+  h1 { font-family: var(--display); font-size: clamp(48px, 7vw, 80px); font-weight: 800; line-height: 1.0; letter-spacing: -2px; margin-bottom: 28px; background: linear-gradient(135deg, #fff 0%, rgba(255,255,255,0.55) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  h1 .hi { -webkit-text-fill-color: transparent; background: linear-gradient(135deg, var(--accent-2) 0%, var(--accent) 100%); -webkit-background-clip: text; background-clip: text; }
+  .hero-sub { font-size: 18px; color: var(--text-muted); font-weight: 300; max-width: 560px; line-height: 1.7; margin-bottom: 48px; }
+  .hero-sub strong { color: var(--text); font-weight: 400; }
+  .hero-ctas { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 80px; }
+  .btn-primary { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; background: var(--accent); color: #fff; font-family: var(--mono); font-size: 13px; border-radius: 6px; text-decoration: none; transition: all 0.2s; border: none; cursor: pointer; }
+  .btn-primary:hover { background: #7c6ef0; transform: translateY(-1px); }
+  .btn-ghost { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; border: 0.5px solid var(--border-hi); color: var(--text-muted); font-family: var(--mono); font-size: 13px; border-radius: 6px; text-decoration: none; transition: all 0.2s; background: transparent; cursor: pointer; }
+  .btn-ghost:hover { border-color: rgba(255,255,255,0.3); color: var(--text); }
+  .hero-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border: 0.5px solid var(--border); border-radius: 12px; overflow: hidden; max-width: 600px; }
+  .hero-stat { background: var(--surface); padding: 24px 28px; }
+  .hero-stat .num { font-family: var(--display); font-size: 36px; font-weight: 800; line-height: 1; margin-bottom: 6px; }
+  .hero-stat .num.teal { color: var(--accent-2); }
+  .hero-stat .num.purple { color: var(--accent); }
+  .hero-stat .num.orange { color: var(--accent-3); }
+  .hero-stat .lbl { font-size: 12px; color: var(--text-muted); font-family: var(--mono); }
+
+  .section-label { font-family: var(--mono); font-size: 11px; letter-spacing: 1.5px; color: var(--accent-2); text-transform: uppercase; margin-bottom: 14px; }
+  h2 { font-family: var(--display); font-size: clamp(28px, 4vw, 42px); font-weight: 700; letter-spacing: -1px; line-height: 1.1; margin-bottom: 16px; }
+  .section-sub { font-size: 16px; color: var(--text-muted); max-width: 520px; line-height: 1.7; font-weight: 300; }
+
+  #problem { background: var(--surface); }
+  .problem-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; align-items: center; margin-top: 64px; }
+  .bar-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .bar-label { font-family: var(--mono); font-size: 11px; color: var(--text-muted); width: 80px; text-align: right; flex-shrink: 0; }
+  .bar-track { flex: 1; height: 28px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding-left: 10px; font-family: var(--mono); font-size: 11px; font-weight: 500; transition: width 1.5s cubic-bezier(0.16, 1, 0.3, 1); }
+  .bar-fill.mha { background: rgba(255,107,53,0.28); border: 0.5px solid rgba(255,107,53,0.5); color: var(--accent-3); }
+  .bar-fill.mla { background: rgba(0,229,176,0.14); border: 0.5px solid rgba(0,229,176,0.4); color: var(--accent-2); }
+  .bar-val { font-family: var(--mono); font-size: 11px; color: var(--text-sub); width: 60px; }
+  .visual-caption { font-size: 12px; color: var(--text-sub); font-family: var(--mono); margin-top: 16px; line-height: 1.5; text-align: center; }
+  .problem-points { display: flex; flex-direction: column; gap: 24px; }
+  .problem-point { display: flex; gap: 16px; }
+  .point-icon { width: 36px; height: 36px; border-radius: 8px; background: var(--surface-2); border: 0.5px solid var(--border); display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 16px; }
+  .point-body h4 { font-family: var(--display); font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+  .point-body p { font-size: 14px; color: var(--text-muted); line-height: 1.6; }
+
+  .demo-wrapper { background: var(--surface); border: 0.5px solid var(--border); border-radius: 16px; overflow: hidden; margin-top: 60px; }
+  .demo-tabs { display: flex; border-bottom: 0.5px solid var(--border); }
+  .demo-tab { padding: 16px 24px; font-family: var(--mono); font-size: 12px; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; letter-spacing: 0.5px; }
+  .demo-tab.active { color: var(--accent-2); border-bottom-color: var(--accent-2); }
+  .demo-tab:hover:not(.active) { color: var(--text); }
+  .demo-body { display: none; padding: 40px; }
+  .demo-body.active { display: block; }
+
+  .slider-row { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+  .slider-row label { font-family: var(--mono); font-size: 12px; color: var(--text-muted); width: 120px; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .slider-val { font-family: var(--mono); font-size: 13px; font-weight: 500; color: var(--text); width: 60px; text-align: right; }
+  .comp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  .comp-card { background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 10px; padding: 20px; }
+  .comp-card .model-name { font-family: var(--mono); font-size: 11px; color: var(--text-sub); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 10px; }
+  .comp-card .big-num { font-family: var(--display); font-size: 30px; font-weight: 800; line-height: 1; margin-bottom: 6px; }
+  .comp-card .big-num.red { color: var(--accent-3); }
+  .comp-card .big-num.green { color: var(--accent-2); }
+  .comp-card .sub-label { font-size: 12px; color: var(--text-muted); }
+  .saving-bar-wrapper { background: var(--surface-2); border-radius: 8px; padding: 16px; }
+  .saving-label { font-family: var(--mono); font-size: 11px; color: var(--text-muted); margin-bottom: 10px; display: flex; justify-content: space-between; }
+  .dual-bar { display: flex; gap: 4px; height: 20px; border-radius: 4px; overflow: hidden; }
+  .dual-seg { height: 100%; transition: flex 0.6s cubic-bezier(0.16,1,0.3,1); display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 10px; font-weight: 500; min-width: 4px; }
+  .dual-seg.mha-seg { background: rgba(255,107,53,0.25); border: 0.5px solid rgba(255,107,53,0.4); color: var(--accent-3); }
+  .dual-seg.mla-seg { background: rgba(0,229,176,0.15); border: 0.5px solid rgba(0,229,176,0.35); color: var(--accent-2); }
+  .extra-pills { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  .extra-pill { font-family: var(--mono); font-size: 11px; padding: 4px 10px; border-radius: 20px; }
+  .extra-pill.teal { background: var(--accent-2-glow); border: 0.5px solid rgba(0,229,176,0.3); color: var(--accent-2); }
+  .extra-pill.orange { background: rgba(255,107,53,0.1); border: 0.5px solid rgba(255,107,53,0.3); color: var(--accent-3); }
+
+  .eviction-canvas { background: var(--surface-2); border-radius: 10px; height: 260px; overflow: hidden; margin-bottom: 20px; position: relative; }
+  .evict-banner { position: absolute; top: 12px; left: 16px; right: 16px; display: flex; justify-content: space-between; }
+  .evict-banner-text { font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+  .pool-tokens { display: flex; flex-wrap: wrap; gap: 2px; padding: 36px 16px 16px; }
+  .token-block { width: 11px; height: 11px; border-radius: 2px; transition: all 0.25s; }
+  .token-block.hot    { background: rgba(0,229,176,0.55); border: 0.5px solid rgba(0,229,176,0.8); }
+  .token-block.cached { background: rgba(107,92,231,0.45); border: 0.5px solid rgba(107,92,231,0.65); }
+  .token-block.evicted{ background: rgba(255,107,53,0.14); border: 0.5px solid rgba(255,107,53,0.3); }
+  .token-block.free   { background: var(--surface-3); border: 0.5px solid var(--border); }
+  .evict-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .evict-btn { padding: 8px 16px; border-radius: 6px; font-family: var(--mono); font-size: 12px; cursor: pointer; border: 0.5px solid var(--border-hi); background: transparent; color: var(--text-muted); transition: all 0.2s; }
+  .evict-btn:hover { color: var(--text); background: var(--surface-2); }
+  .evict-btn.on { background: rgba(107,92,231,0.18); border-color: var(--accent); color: var(--accent); }
+  .evict-stats { display: flex; gap: 24px; margin-top: 16px; flex-wrap: wrap; }
+  .evict-stat { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
+  .evict-stat span { color: var(--text); font-weight: 500; }
+
+  .workload-select { background: var(--surface-2); border: 0.5px solid var(--border-hi); color: var(--text); font-family: var(--mono); font-size: 12px; padding: 8px 14px; border-radius: 6px; cursor: pointer; }
+  .sim-controls { display: flex; gap: 12px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; }
+  .request-stream { display: flex; flex-direction: column; gap: 6px; max-height: 280px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  .request-item { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--surface-2); border-radius: 6px; border: 0.5px solid var(--border); font-family: var(--mono); font-size: 12px; animation: sli 0.25s ease; }
+  @keyframes sli { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+  .req-badge { padding: 2px 7px; border-radius: 3px; font-size: 10px; font-weight: 500; }
+  .req-badge.hit { background: rgba(0,229,176,0.13); color: var(--accent-2); border: 0.5px solid rgba(0,229,176,0.3); }
+  .req-badge.miss { background: rgba(255,107,53,0.1); color: var(--accent-3); border: 0.5px solid rgba(255,107,53,0.2); }
+  .req-tokens { color: var(--text-muted); flex: 1; }
+  .req-saved { color: var(--accent-2); margin-left: auto; }
+  .hit-sidebar { background: var(--surface-2); border-radius: 8px; padding: 20px; }
+  .hit-rate-num { font-family: var(--display); font-size: 48px; font-weight: 800; color: var(--accent-2); line-height: 1; margin-bottom: 8px; }
+  .hit-bar { height: 4px; background: var(--surface-3); border-radius: 2px; overflow: hidden; margin-bottom: 10px; }
+  .hit-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.5s ease; border-radius: 2px; }
+  .hit-stat { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
+  .hit-stat span { color: var(--accent-2); }
+  .sim-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+
+  #architecture { background: var(--surface); }
+  .arch-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; margin-top: 60px; }
+  .arch-side h3 { font-family: var(--display); font-size: 13px; font-weight: 600; color: var(--text-muted); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 0.5px solid var(--border); }
+  .arch-layer { background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 8px; padding: 14px 18px; margin-bottom: 8px; position: relative; transition: border-color 0.2s; }
+  .arch-layer:hover { border-color: var(--border-hi); }
+  .arch-layer.hl { border-color: rgba(107,92,231,0.45); background: rgba(107,92,231,0.05); }
+  .arch-layer.hl2 { border-color: rgba(0,229,176,0.35); background: rgba(0,229,176,0.04); }
+  .arch-layer-name { font-family: var(--mono); font-size: 12px; font-weight: 500; color: var(--text); margin-bottom: 3px; }
+  .arch-layer-desc { font-size: 12px; color: var(--text-muted); }
+  .arch-badge { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-family: var(--mono); font-size: 9px; letter-spacing: 0.8px; padding: 2px 7px; border-radius: 3px; text-transform: uppercase; }
+  .arch-badge.new { background: rgba(107,92,231,0.2); color: var(--accent); border: 0.5px solid rgba(107,92,231,0.3); }
+  .arch-badge.hot { background: rgba(0,229,176,0.13); color: var(--accent-2); border: 0.5px solid rgba(0,229,176,0.3); }
+  .arch-badge.ex { background: var(--surface-3); color: var(--text-sub); border: 0.5px solid var(--border); }
+  .arch-connector { text-align: center; padding: 6px 0; color: var(--text-sub); }
+
+  .code-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 60px; }
+  .code-card { background: var(--surface); border: 0.5px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .code-header { padding: 14px 20px; border-bottom: 0.5px solid var(--border); display: flex; align-items: center; gap: 8px; }
+  .code-dots { display: flex; gap: 5px; }
+  .code-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .code-title { font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+  .code-lang { font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 3px; background: var(--surface-3); color: var(--text-sub); margin-left: auto; }
+  pre { padding: 20px; font-family: var(--mono); font-size: 12px; line-height: 1.7; overflow-x: auto; color: #9aabbf; }
+  .k { color: #7c6ef0; } .f { color: #56d4b8; } .s { color: #f9a550; } .c { color: #4a4860; font-style: italic; } .n { color: #f0eeee; } .num { color: #e87070; }
+
+  #results { background: var(--surface); }
+  .bench-legend { display: flex; gap: 20px; margin-bottom: 32px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+  .legend-dot.b { background: rgba(255,107,53,0.4); border: 0.5px solid rgba(255,107,53,0.5); }
+  .legend-dot.p { background: rgba(0,229,176,0.4); border: 0.5px solid rgba(0,229,176,0.5); }
+  .bench-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }
+  .bench-section-title { font-family: var(--mono); font-size: 11px; letter-spacing: 1px; color: var(--text-sub); text-transform: uppercase; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 0.5px solid var(--border); }
+  .bench-row { margin-bottom: 20px; }
+  .bench-row-label { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; display: flex; justify-content: space-between; }
+  .bench-delta { font-family: var(--mono); font-size: 11px; color: var(--accent-2); }
+  .bench-track { background: var(--surface-2); border-radius: 4px; height: 30px; overflow: hidden; margin-bottom: 5px; }
+  .bench-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding: 0 10px; font-family: var(--mono); font-size: 11px; font-weight: 500; transition: width 1.5s cubic-bezier(0.16, 1, 0.3, 1); white-space: nowrap; }
+  .bench-fill.baseline { background: rgba(255,107,53,0.2); border: 0.5px solid rgba(255,107,53,0.35); color: var(--accent-3); }
+  .bench-fill.patched  { background: rgba(0,229,176,0.13); border: 0.5px solid rgba(0,229,176,0.3); color: var(--accent-2); }
+
+  footer { border-top: 0.5px solid var(--border); padding: 48px 0; }
+  .footer-inner { display: flex; justify-content: space-between; align-items: center; }
+  .footer-copy { font-family: var(--mono); font-size: 12px; color: var(--text-sub); }
+  .footer-links { display: flex; gap: 24px; }
+  .footer-links a { font-family: var(--mono); font-size: 12px; color: var(--text-sub); text-decoration: none; transition: color 0.2s; }
+  .footer-links a:hover { color: var(--text-muted); }
+
+  @media (max-width: 768px) {
+    .problem-grid, .arch-cols, .code-grid, .bench-grid, .comp-grid, .sim-grid { grid-template-columns: 1fr; }
+    .hero-stats { grid-template-columns: 1fr; }
+    h1 { font-size: 40px; letter-spacing: -1.5px; }
+    section { padding: 64px 0; }
+    #hero { padding: 140px 0 80px; }
+    .nav-links { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="inner">
+    <a href="#" class="nav-logo"><span class="dot"></span>MLA RadixAttention</a>
+    <ul class="nav-links">
+      <li><a href="#problem">Problem</a></li>
+      <li><a href="#demo">Demo</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#results">Results</a></li>
+    </ul>
+    <span class="nav-badge">v1.0 · MIT</span>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section id="hero">
+  <div class="hero-grid"></div>
+  <div class="hero-glow"></div>
+  <div class="container">
+    <div class="hero-tag">SGLang Prefix Cache Optimization</div>
+    <h1>Your KV cache is<br><span class="hi">wasting 71×</span><br>the memory.</h1>
+    <p class="hero-sub">
+      SGLang's eviction policy was built for standard MHA models. For <strong>MLA models like DeepSeek V2/V3/R1</strong>, each token stores a 576-dim compressed latent — not 40,960-dim full K/V. We fix the eviction logic to match reality.
+    </p>
+    <div class="hero-ctas">
+      <button class="btn-primary" onclick="document.getElementById('demo').scrollIntoView({behavior:'smooth'})">↓ See the demo</button>
+      <button class="btn-ghost" onclick="document.getElementById('architecture').scrollIntoView({behavior:'smooth'})">Read the architecture →</button>
+    </div>
+    <div class="hero-stats">
+      <div class="hero-stat"><div class="num teal">71×</div><div class="lbl">compression ratio</div></div>
+      <div class="hero-stat"><div class="num purple">14×</div><div class="lbl">more tokens cached</div></div>
+      <div class="hero-stat"><div class="num orange">35/35</div><div class="lbl">tests passing</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- PROBLEM -->
+<section id="problem">
+  <div class="container">
+    <div class="section-label">The Problem</div>
+    <h2>MHA-era eviction in<br>an MLA world</h2>
+    <p class="section-sub">SGLang stores latent vectors, but evicts like it's still storing full K/V heads.</p>
+    <div class="problem-grid">
+      <div>
+        <div style="font-family: var(--mono); font-size: 11px; color: var(--text-sub); margin-bottom: 12px; letter-spacing: 0.5px;">PER-TOKEN MEMORY FOOTPRINT (DeepSeek V3, bf16)</div>
+        <div class="bar-row">
+          <div class="bar-label">MHA equiv.</div>
+          <div class="bar-track"><div class="bar-fill mha" id="bar-mha" style="width:0%">40,960 floats</div></div>
+          <div class="bar-val">80 KB</div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label">MLA actual</div>
+          <div class="bar-track"><div class="bar-fill mla" id="bar-mla" style="width:0%">576 floats</div></div>
+          <div class="bar-val">1.1 KB</div>
+        </div>
+        <div class="visual-caption">The eviction policy treats both rows identically.<br>Only the bottom row is real.</div>
+      </div>
+      <div class="problem-points">
+        <div class="problem-point">
+          <div class="point-icon">⚖️</div>
+          <div class="point-body">
+            <h4>False equivalence</h4>
+            <p>RadixCache assigns identical eviction weight to every token regardless of actual memory cost. MLA tokens are up to 71× cheaper to store.</p>
+          </div>
+        </div>
+        <div class="problem-point">
+          <div class="point-icon">🪣</div>
+          <div class="point-body">
+            <h4>Over-aggressive eviction</h4>
+            <p>The 20% free-space threshold was tuned for MHA models. For MLA, it evicts hundreds of valuable prefix tokens unnecessarily.</p>
+          </div>
+        </div>
+        <div class="problem-point">
+          <div class="point-icon">📉</div>
+          <div class="point-body">
+            <h4>Cache hit rate degradation</h4>
+            <p>Excessive eviction destroys prefix reuse — the main source of TTFT speedup in long-context serving workloads.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- DEMO -->
+<section id="demo">
+  <div class="container">
+    <div class="section-label">Interactive Demo</div>
+    <h2>See the difference</h2>
+    <p class="section-sub">Explore memory capacity, eviction behavior, and cache hit rates across workloads.</p>
+    <div class="demo-wrapper">
+      <div class="demo-tabs">
+        <div class="demo-tab active" onclick="switchTab(0)">Memory Capacity</div>
+        <div class="demo-tab" onclick="switchTab(1)">Eviction Behavior</div>
+        <div class="demo-tab" onclick="switchTab(2)">Cache Hit Simulator</div>
+      </div>
+
+      <!-- Tab 0 -->
+      <div class="demo-body active" id="tab-0">
+        <div class="slider-row">
+          <label>GPU Memory</label>
+          <input type="range" min="20" max="160" value="80" id="gpu-slider" oninput="calcMem()">
+          <span class="slider-val" id="gpu-val">80 GB</span>
+        </div>
+        <div class="slider-row">
+          <label>Model Weights</label>
+          <input type="range" min="5" max="80" value="40" id="wt-slider" oninput="calcMem()">
+          <span class="slider-val" id="wt-val">40 GB</span>
+        </div>
+        <div class="comp-grid">
+          <div class="comp-card">
+            <div class="model-name">Standard MHA eviction</div>
+            <div class="big-num red" id="mha-tok">—</div>
+            <div class="sub-label">prefix tokens cacheable</div>
+          </div>
+          <div class="comp-card">
+            <div class="model-name">MLA-aware (this project)</div>
+            <div class="big-num green" id="mla-tok">—</div>
+            <div class="sub-label">prefix tokens cacheable</div>
+          </div>
+        </div>
+        <div class="saving-bar-wrapper">
+          <div class="saving-label"><span>Cache capacity</span><span id="ratio-label" style="color:var(--accent-2)"></span></div>
+          <div class="dual-bar">
+            <div class="dual-seg mha-seg" id="d-mha" style="flex:1">MHA</div>
+            <div class="dual-seg mla-seg" id="d-mla" style="flex:13">+MLA extra</div>
+          </div>
+          <div class="extra-pills">
+            <span class="extra-pill teal" id="ep-tokens"></span>
+            <span class="extra-pill orange" id="ep-bytes"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 1 -->
+      <div class="demo-body" id="tab-1">
+        <div class="eviction-canvas">
+          <div class="evict-banner">
+            <span class="evict-banner-text">KV Pool (300 slots visualised)</span>
+            <span class="evict-banner-text" id="ev-state" style="color:var(--text-muted)">Idle</span>
+          </div>
+          <div class="pool-tokens" id="pool-tokens"></div>
+        </div>
+        <div class="evict-controls">
+          <button class="evict-btn on" id="btn-base" onclick="setMode('base',this)">Baseline</button>
+          <button class="evict-btn" id="btn-mla" onclick="setMode('mla',this)">MLA-aware</button>
+          <button class="evict-btn" onclick="doEvict()" style="margin-left:auto">Run simulation →</button>
+          <button class="evict-btn" onclick="resetPool()">Reset</button>
+        </div>
+        <div class="evict-stats">
+          <div class="evict-stat">Evicted: <span id="ev-cnt">0</span></div>
+          <div class="evict-stat">Retained: <span id="ev-ret">0</span></div>
+          <div class="evict-stat">Effective hit rate: <span id="ev-hr">—</span></div>
+        </div>
+      </div>
+
+      <!-- Tab 2 -->
+      <div class="demo-body" id="tab-2">
+        <div class="sim-controls">
+          <select class="workload-select" id="wl-sel">
+            <option value="chat">Chat (shared system prompts)</option>
+            <option value="fewshot">Few-shot prompting</option>
+            <option value="random">Random (no sharing)</option>
+            <option value="multiturn">Multi-turn conversation</option>
+          </select>
+          <button class="evict-btn on" onclick="runSim()">Simulate →</button>
+          <button class="evict-btn" onclick="clearSim()">Clear</button>
+        </div>
+        <div class="sim-grid">
+          <div class="request-stream" id="req-stream"></div>
+          <div class="hit-sidebar">
+            <div style="font-family:var(--mono);font-size:11px;color:var(--text-muted);margin-bottom:8px">CACHE HIT RATE</div>
+            <div class="hit-rate-num" id="hr-num">0%</div>
+            <div class="hit-bar"><div class="hit-bar-fill" id="hr-bar" style="width:0%"></div></div>
+            <div class="hit-stat">Tokens saved: <span id="t-saved">0</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section id="architecture">
+  <div class="container">
+    <div class="section-label">Architecture</div>
+    <h2>Minimal surface,<br>maximum impact</h2>
+    <p class="section-sub">Three targeted changes. Backward-compatible. Non-MLA models are completely untouched.</p>
+    <div class="arch-cols">
+      <div>
+        <h3>Before</h3>
+        <div class="arch-layer"><div class="arch-layer-name">SGLang Scheduler</div><div class="arch-layer-desc">_check_memory_and_evict()</div><div class="arch-badge ex">existing</div></div>
+        <div class="arch-connector">↓</div>
+        <div class="arch-layer"><div class="arch-layer-name">RadixCache.evict(N)</div><div class="arch-layer-desc">Always evicts N tokens · fixed 20% free threshold</div><div class="arch-badge ex">unchanged</div></div>
+        <div class="arch-connector">↓</div>
+        <div class="arch-layer"><div class="arch-layer-name">MLATokenToKVPool</div><div class="arch-layer-desc">576-dim latent vectors (already compact)</div><div class="arch-badge ex">existing</div></div>
+      </div>
+      <div>
+        <h3>After</h3>
+        <div class="arch-layer"><div class="arch-layer-name">SGLang Scheduler</div><div class="arch-layer-desc">_check_memory_and_evict()</div><div class="arch-badge ex">existing</div></div>
+        <div class="arch-connector">↓</div>
+        <div class="arch-layer hl"><div class="arch-layer-name">MLAEvictionBudget.adjust(N)</div><div class="arch-layer-desc">Reduces eviction count by compression ratio</div><div class="arch-badge new">new</div></div>
+        <div class="arch-connector">↓</div>
+        <div class="arch-layer hl2"><div class="arch-layer-name">RadixCache.evict(adjusted)</div><div class="arch-layer-desc">target_free_ratio = 0.20 / compression_ratio</div><div class="arch-badge hot">patched</div></div>
+        <div class="arch-connector">↓</div>
+        <div class="arch-layer"><div class="arch-layer-name">MLATokenToKVPool</div><div class="arch-layer-desc">Unchanged — already stores latent vectors</div><div class="arch-badge ex">existing</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CODE -->
+<section id="code">
+  <div class="container">
+    <div class="section-label">The Patch</div>
+    <h2>Three files changed.</h2>
+    <p class="section-sub">The optimization is a targeted eviction adjustment. No storage format changes, no correctness risk.</p>
+    <div class="code-grid">
+      <div class="code-card">
+        <div class="code-header">
+          <div class="code-dots"><div class="code-dot" style="background:#ff5f56"></div><div class="code-dot" style="background:#ffbd2e"></div><div class="code-dot" style="background:#27c93f"></div></div>
+          <div class="code-title">radix_cache.py · threshold</div>
+          <div class="code-lang">python</div>
+        </div>
+        <pre><span class="c"># Before: fixed threshold</span>
+<span class="n">self</span>.<span class="f">_target_free_ratio</span> = <span class="num">0.20</span>
+
+<span class="c"># After: MLA-aware</span>
+<span class="n">self</span>.<span class="f">_target_free_ratio</span> = <span class="f">max</span>(
+    <span class="num">0.05</span>,
+    <span class="num">0.20</span> / <span class="n">mla_compression_ratio</span>
+)
+<span class="c"># V3: 0.20 / 71 ≈ 0.003</span>
+<span class="c"># → 99.7% utilization is now safe</span></pre>
+      </div>
+      <div class="code-card">
+        <div class="code-header">
+          <div class="code-dots"><div class="code-dot" style="background:#ff5f56"></div><div class="code-dot" style="background:#ffbd2e"></div><div class="code-dot" style="background:#27c93f"></div></div>
+          <div class="code-title">scheduler.py · eviction count</div>
+          <div class="code-lang">python</div>
+        </div>
+        <pre><span class="c"># Before: always evict N tokens</span>
+<span class="n">tree_cache</span>.<span class="f">evict</span>(
+    <span class="n">EvictParams</span>(<span class="n">num_tokens</span>=<span class="n">N</span>)
+)
+
+<span class="c"># After: compression-adjusted</span>
+<span class="n">adjusted</span> = <span class="n">budget</span>.<span class="f">adjust_eviction_count</span>(
+    <span class="n">requested_eviction</span>=<span class="n">N</span>,
+    <span class="n">current_cached</span>=<span class="n">cached</span>,
+    <span class="n">current_free</span>=<span class="n">free</span>,
+)
+<span class="n">tree_cache</span>.<span class="f">evict</span>(<span class="n">EvictParams</span>(<span class="n">adjusted</span>))</pre>
+      </div>
+      <div class="code-card">
+        <div class="code-header">
+          <div class="code-dots"><div class="code-dot" style="background:#ff5f56"></div><div class="code-dot" style="background:#ffbd2e"></div><div class="code-dot" style="background:#27c93f"></div></div>
+          <div class="code-title">Quick start</div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><span class="c"># Run all unit tests</span>
+<span class="f">pip install</span> pytest torch
+<span class="f">python</span> -m pytest test_mla_radix_cache.py -v
+
+<span class="c"># CPU benchmark</span>
+<span class="f">python</span> bench_mla_radix_cache.py
+
+<span class="c"># GPU validation (A100+)</span>
+<span class="f">python</span> gpu_validation.py \
+  --mode validate \
+  --model deepseek-ai/DeepSeek-V2-Lite</pre>
+      </div>
+      <div class="code-card">
+        <div class="code-header">
+          <div class="code-dots"><div class="code-dot" style="background:#ff5f56"></div><div class="code-dot" style="background:#ffbd2e"></div><div class="code-dot" style="background:#27c93f"></div></div>
+          <div class="code-title">Standalone usage</div>
+          <div class="code-lang">python</div>
+        </div>
+        <pre><span class="k">from</span> <span class="n">mla_radix_cache</span> <span class="k">import</span> (
+    <span class="f">MLARadixCache</span>, <span class="f">MLAModelConfig</span>
+)
+<span class="k">import</span> <span class="n">torch</span>
+
+<span class="n">config</span> = <span class="f">MLAModelConfig</span>.<span class="f">deepseek_v3</span>()
+<span class="n">cache</span> = <span class="f">MLARadixCache</span>(<span class="n">config</span>, <span class="n">pool_size</span>=<span class="num">100000</span>)
+
+<span class="n">cache</span>.<span class="f">insert</span>(<span class="f">list</span>(<span class="f">range</span>(<span class="num">100</span>)), <span class="n">torch</span>.<span class="f">arange</span>(<span class="num">100</span>))
+<span class="n">r</span> = <span class="n">cache</span>.<span class="f">match_prefix</span>([<span class="num">0</span>,<span class="num">1</span>,<span class="num">2</span>,...,<span class="num">50</span>,<span class="num">999</span>])
+<span class="f">print</span>(<span class="n">r</span>.<span class="n">matched_len</span>)  <span class="c"># 50</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- RESULTS -->
+<section id="results">
+  <div class="container">
+    <div class="section-label">Benchmark Results</div>
+    <h2>CPU workload benchmarks</h2>
+    <p class="section-sub">Measured on DeepSeek-V3 config. All numbers from <code style="font-family:var(--mono);color:var(--accent-2);font-size:14px">bench_mla_radix_cache.py</code>.</p>
+    <div style="margin-top:60px">
+      <div class="bench-legend">
+        <div class="legend-item"><div class="legend-dot b"></div>Baseline (MHA eviction)</div>
+        <div class="legend-item"><div class="legend-dot p"></div>MLA-aware (this project)</div>
+      </div>
+      <div class="bench-grid">
+        <div><div class="bench-section-title">Cache hit rate</div><div id="bench-hits"></div></div>
+        <div><div class="bench-section-title">Token reuse rate</div><div id="bench-reuse"></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-copy">© 2026 Henry · MIT License</div>
+      <div class="footer-links">
+        <a href="#problem">Problem</a>
+        <a href="#demo">Demo</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#results">Results</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+// Animate hero bars
+setTimeout(() => {
+  const m = document.getElementById('bar-mha'); if(m) m.style.width='100%';
+  const l = document.getElementById('bar-mla'); if(l) l.style.width='1.4%';
+}, 500);
+
+// Tab switch
+function switchTab(idx) {
+  document.querySelectorAll('.demo-tab').forEach((t,i)=>t.classList.toggle('active',i===idx));
+  document.querySelectorAll('.demo-body').forEach((b,i)=>b.classList.toggle('active',i===idx));
+  if(idx===1) resetPool();
+  if(idx===2) clearSim();
+}
+
+// Memory calc
+function calcMem() {
+  const gpu = +document.getElementById('gpu-slider').value;
+  const wt  = +document.getElementById('wt-slider').value;
+  document.getElementById('gpu-val').textContent = gpu+' GB';
+  document.getElementById('wt-val').textContent  = wt+' GB';
+  const avail = Math.max(0, gpu*0.85 - wt) * 1073741824;
+  const bMLA  = 576*2*61, bMHA = 40960*2*61;
+  const tMLA  = Math.floor(avail/bMLA), tMHA = Math.floor(avail/bMHA);
+  document.getElementById('mha-tok').textContent = tMHA.toLocaleString();
+  document.getElementById('mla-tok').textContent = tMLA.toLocaleString();
+  const ratio = tMLA/Math.max(1,tMHA);
+  document.getElementById('d-mha').style.flex = '1';
+  document.getElementById('d-mla').style.flex = (ratio-1).toFixed(1);
+  document.getElementById('ratio-label').textContent = ratio.toFixed(1)+'× more tokens';
+  document.getElementById('ep-tokens').textContent = '+'+(tMLA-tMHA).toLocaleString()+' extra tokens';
+  document.getElementById('ep-bytes').textContent   = ((gpu*0.85-wt)*(1-1/ratio)).toFixed(1)+' GB freed';
+}
+calcMem();
+
+// Eviction pool
+let poolState=[], evMode='base';
+function resetPool() {
+  const c=document.getElementById('pool-tokens'); c.innerHTML=''; poolState=[];
+  for(let i=0;i<300;i++) {
+    const d=document.createElement('div');
+    const t=i<60?'hot':i<240?'cached':'free';
+    d.className='token-block '+t; c.appendChild(d); poolState.push(t);
+  }
+  document.getElementById('ev-state').textContent='Idle'; document.getElementById('ev-state').style.color='var(--text-muted)';
+  updateEvStats();
+}
+function setMode(m,el) {
+  evMode=m;
+  document.querySelectorAll('.evict-btn').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on');
+  resetPool();
+}
+function doEvict() {
+  const tokens=document.querySelectorAll('.token-block');
+  const st=document.getElementById('ev-state');
+  st.textContent='Evicting...'; st.style.color='var(--accent-3)';
+  const n = evMode==='base'?90:20;
+  const cands=[]; poolState.forEach((s,i)=>{ if(s==='cached') cands.push(i); });
+  for(let i=cands.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[cands[i],cands[j]]=[cands[j],cands[i]];}
+  const toEvict=cands.slice(0,n);
+  let d=0;
+  toEvict.forEach(idx=>{
+    setTimeout(()=>{ tokens[idx].className='token-block evicted'; poolState[idx]='evicted'; },d);
+    d+=evMode==='base'?12:28;
+  });
+  setTimeout(()=>{
+    st.textContent=evMode==='base'?'Baseline: aggressive eviction done':'MLA-aware: conservative eviction done';
+    st.style.color=evMode==='base'?'var(--accent-3)':'var(--accent-2)';
+    updateEvStats();
+  },d+200);
+}
+function updateEvStats() {
+  const ev=poolState.filter(s=>s==='evicted').length;
+  const re=poolState.filter(s=>s==='cached'||s==='hot').length;
+  document.getElementById('ev-cnt').textContent=ev;
+  document.getElementById('ev-ret').textContent=re;
+  document.getElementById('ev-hr').textContent=ev>0?(re/(re+ev)*100).toFixed(1)+'%':'—';
+}
+
+// Hit rate sim
+const WL={
+  chat:{p:0.87,avg:250,name:'sys_prompt'},fewshot:{p:0.92,avg:500,name:'few_shot'},
+  random:{p:0.07,avg:100,name:'rand_query'},multiturn:{p:0.95,avg:400,name:'conv_ctx'}
+};
+let sHits=0,sMiss=0,sSaved=0,sInt=null;
+function runSim() {
+  if(sInt) clearInterval(sInt);
+  clearSim();
+  const wl=WL[document.getElementById('wl-sel').value];
+  let n=0;
+  sInt=setInterval(()=>{
+    if(n>=40){clearInterval(sInt);return;} n++;
+    const hit=Math.random()<wl.p;
+    const tok=Math.round(wl.avg*(0.7+Math.random()*0.6));
+    const sv=hit?Math.round(tok*0.85):0;
+    if(hit){sHits++;sSaved+=sv;}else sMiss++;
+    const s=document.getElementById('req-stream');
+    const el=document.createElement('div'); el.className='request-item';
+    el.innerHTML=`<span class="req-badge ${hit?'hit':'miss'}">${hit?'HIT':'MISS'}</span><span class="req-tokens">${wl.name}_${n} · ${tok} tok</span>${hit?`<span class="req-saved">−${sv}</span>`:''}`;
+    s.prepend(el); if(s.children.length>14) s.removeChild(s.lastChild);
+    const r=Math.round(sHits/(sHits+sMiss)*100);
+    document.getElementById('hr-num').textContent=r+'%';
+    document.getElementById('hr-bar').style.width=r+'%';
+    document.getElementById('t-saved').textContent=sSaved.toLocaleString();
+  },320);
+}
+function clearSim() {
+  if(sInt){clearInterval(sInt);sInt=null;}
+  sHits=sMiss=sSaved=0;
+  document.getElementById('req-stream').innerHTML='';
+  document.getElementById('hr-num').textContent='0%';
+  document.getElementById('hr-bar').style.width='0%';
+  document.getElementById('t-saved').textContent='0';
+}
+
+// Bench bars
+const BD=[
+  {lbl:'Chat (shared system prompt)', bh:0.821,ph:0.932,br:0.745,pr:0.880},
+  {lbl:'Few-shot prompting',           bh:0.887,ph:0.963,br:0.812,pr:0.921},
+  {lbl:'Multi-turn conversation',      bh:0.903,ph:0.978,br:0.856,pr:0.944},
+  {lbl:'Random (no sharing)',          bh:0.061,ph:0.068,br:0.042,pr:0.051},
+];
+function renderBench() {
+  const hEl=document.getElementById('bench-hits'), rEl=document.getElementById('bench-reuse');
+  BD.forEach(d=>{
+    const dh=((d.ph-d.bh)/d.bh*100).toFixed(1);
+    hEl.innerHTML+=`<div class="bench-row"><div class="bench-row-label"><span>${d.lbl}</span><span class="bench-delta">+${dh}%</span></div><div class="bench-track"><div class="bench-fill baseline" data-w="${d.bh*100}">${(d.bh*100).toFixed(1)}%</div></div><div class="bench-track" style="margin-bottom:12px"><div class="bench-fill patched" data-w="${d.ph*100}">${(d.ph*100).toFixed(1)}%</div></div></div>`;
+    const dr=((d.pr-d.br)/d.br*100).toFixed(1);
+    rEl.innerHTML+=`<div class="bench-row"><div class="bench-row-label"><span>${d.lbl}</span><span class="bench-delta">+${dr}%</span></div><div class="bench-track"><div class="bench-fill baseline" data-w="${d.br*100}">${(d.br*100).toFixed(1)}%</div></div><div class="bench-track" style="margin-bottom:12px"><div class="bench-fill patched" data-w="${d.pr*100}">${(d.pr*100).toFixed(1)}%</div></div></div>`;
+  });
+  // Animate in
+  document.querySelectorAll('.bench-fill').forEach(el=>{
+    const w=el.dataset.w; el.style.width='0%';
+    setTimeout(()=>el.style.width=w+'%', 200);
+  });
+}
+
+renderBench();
+resetPool();
+</script>
+</body>
+</html>

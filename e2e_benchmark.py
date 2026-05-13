@@ -11,13 +11,13 @@ Key fixes vs original:
 
 Usage:
     # Sanity check (no eviction pressure):
-    CUDA_VISIBLE_DEVICES=2 python e2e_benchmark_fixed.py \\
+    CUDA_VISIBLE_DEVICES=2 python e2e_benchmark.py \\
         --model deepseek-ai/DeepSeek-V2-Lite \\
         --num-prompts 200 --num-system-prompts 20 \\
         --results-dir results_no_pressure
 
     # Eviction pressure (cache demand > pool):
-    CUDA_VISIBLE_DEVICES=2 python e2e_benchmark_fixed.py \\
+    CUDA_VISIBLE_DEVICES=2 python e2e_benchmark.py \\
         --model deepseek-ai/DeepSeek-V2-Lite \\
         --num-prompts 300 --num-system-prompts 150 \\
         --results-dir results_pressure
