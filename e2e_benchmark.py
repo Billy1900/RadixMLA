@@ -1,789 +1,505 @@
 #!/usr/bin/env python3
 """
-Phase 4: End-to-End Benchmark for MLA-aware RadixAttention.
+Fixed e2e_benchmark — MLA-aware RadixAttention benchmark.
 
-Measures the real impact of MLA-aware eviction on SGLang serving:
-- Prefix cache hit rate
-- TTFT (time to first token)
-- Throughput (tokens/s)
-- Memory utilization
-
-Experiments:
-1. High prefix reuse: ShareGPT dataset (shared system prompts)
-2. Synthetic high-sharing: 1000 requests sharing a 2048-token system prompt
-3. Synthetic no-sharing: random prompts (regression test)
-4. Memory pressure: small pool forcing evictions
+Key fixes vs original:
+1. Two Engine() in one process → each mode in its own subprocess
+2. asyncio/uvloop destroyed by Engine.__init__ → recreated after init  
+3. apply_mla_eviction_patch deadlock on available_size() → inline simpler patch
+4. cache_hit_rate from get_server_info() → per-request meta_info
+5. Pressure via --num-system-prompts, not mem-fraction
 
 Usage:
-    # Run all experiments (requires SGLang + GPU):
-    python e2e_benchmark.py --model deepseek-ai/DeepSeek-V2-Lite
+    # Sanity check (no eviction pressure):
+    CUDA_VISIBLE_DEVICES=2 python e2e_benchmark_fixed.py \\
+        --model deepseek-ai/DeepSeek-V2-Lite \\
+        --num-prompts 200 --num-system-prompts 20 \\
+        --results-dir results_no_pressure
 
-    # Single experiment:
-    python e2e_benchmark.py --experiment sharegpt
-
-    # Generate report from saved results:
-    python e2e_benchmark.py --mode report --results-dir benchmark_results
+    # Eviction pressure (cache demand > pool):
+    CUDA_VISIBLE_DEVICES=2 python e2e_benchmark_fixed.py \\
+        --model deepseek-ai/DeepSeek-V2-Lite \\
+        --num-prompts 300 --num-system-prompts 150 \\
+        --results-dir results_pressure
 """
 
 import argparse
-import asyncio
 import json
 import logging
 import os
+import statistics
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+RESULTS_DIR = "benchmark_results"
+MIN_SAFE_MEM_FRACTION = 0.50
 
 
-# ────────────────────────────────────────────────────────────────────
-# Data structures
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# Inline MLA patch — avoids the deadlock in gpu_validation.py
+# ─────────────────────────────────────────────────────────────────
 
-@dataclass
-class ExperimentConfig:
-    name: str
-    description: str
-
-    # Workload
-    dataset: str  # "sharegpt", "random", "synthetic_shared"
-    num_prompts: int = 500
-    random_input_len: Optional[int] = None
-    random_output_len: Optional[int] = None
-
-    # Server
-    model: str = "deepseek-ai/DeepSeek-V2-Lite"
-    tp_size: int = 1
-    mem_fraction_static: float = 0.85
-    extra_server_args: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ExperimentResult:
-    config: Dict[str, Any]
-    mode: str  # "baseline" or "patched"
-
-    # Performance
-    total_time_s: float = 0.0
-    request_throughput: float = 0.0  # req/s
-    input_throughput: float = 0.0   # tokens/s
-    output_throughput: float = 0.0  # tokens/s
-
-    # Latency (ms)
-    ttft_avg_ms: float = 0.0
-    ttft_p50_ms: float = 0.0
-    ttft_p99_ms: float = 0.0
-    tpot_avg_ms: float = 0.0  # time per output token
-
-    # Cache metrics
-    prefix_cache_hit_rate: float = 0.0
-    num_evictions: int = 0
-    cache_tokens_used: int = 0
-
-    # Raw bench_serving output
-    raw_output: str = ""
-
-
-# ────────────────────────────────────────────────────────────────────
-# Experiment definitions
-# ────────────────────────────────────────────────────────────────────
-
-EXPERIMENTS = {
-    "sharegpt": ExperimentConfig(
-        name="sharegpt",
-        description="ShareGPT dataset — natural chat workload with shared system prompts",
-        dataset="sharegpt",
-        num_prompts=500,
-    ),
-
-    "high_sharing": ExperimentConfig(
-        name="high_sharing",
-        description="Synthetic workload: 500 requests with 1024-token shared prefix + 128 unique",
-        dataset="random",
-        num_prompts=500,
-        random_input_len=1024,
-        random_output_len=128,
-        extra_server_args=["--random-range-ratio", "1.0"],
-    ),
-
-    "no_sharing": ExperimentConfig(
-        name="no_sharing",
-        description="Regression test: random prompts with no prefix sharing",
-        dataset="random",
-        num_prompts=300,
-        random_input_len=256,
-        random_output_len=64,
-    ),
-
-    "memory_pressure": ExperimentConfig(
-        name="memory_pressure",
-        description="Memory pressure: reduced pool to force evictions",
-        dataset="sharegpt",
-        num_prompts=500,
-        mem_fraction_static=0.5,  # Lower → more evictions
-    ),
-
-    "long_prefix": ExperimentConfig(
-        name="long_prefix",
-        description="Long prefix reuse: 2048-token shared prefix",
-        dataset="random",
-        num_prompts=200,
-        random_input_len=2048,
-        random_output_len=64,
-        extra_server_args=["--random-range-ratio", "1.0"],
-    ),
-}
-
-
-# ────────────────────────────────────────────────────────────────────
-# Server management
-# ────────────────────────────────────────────────────────────────────
-
-def start_server(
-    config: ExperimentConfig,
-    port: int = 30000,
-    patched: bool = False,
-    log_file: Optional[str] = None,
-) -> subprocess.Popen:
-    """Start an SGLang server process."""
-
-    cmd = [
-        sys.executable, "-m", "sglang.launch_server",
-        "--model-path", config.model,
-        "--tp", str(config.tp_size),
-        "--port", str(port),
-        "--trust-remote-code",
-        "--mem-fraction-static", str(config.mem_fraction_static),
-        "--log-level", "info",
-    ]
-
-    if patched:
-        # Set env var to signal the MLA patch should be applied
-        os.environ["SGLANG_MLA_EVICTION_PATCH"] = "1"
-    else:
-        os.environ.pop("SGLANG_MLA_EVICTION_PATCH", None)
-
-    cmd.extend(config.extra_server_args)
-
-    logger.info(f"Starting server: {' '.join(cmd)}")
-
-    log_handle = None
-    if log_file:
-        log_handle = open(log_file, "w")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_handle or subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-
-    # Wait for server to be ready
-    wait_for_server(port, timeout=300)
-
-    return proc
-
-
-def wait_for_server(port: int, timeout: int = 300):
-    """Wait until the SGLang server is ready."""
-    import requests
-
-    url = f"http://localhost:{port}/health"
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            resp = requests.get(url, timeout=2)
-            if resp.status_code == 200:
-                logger.info(f"Server ready on port {port}")
-                return
-        except Exception:
-            pass
-        time.sleep(2)
-
-    raise TimeoutError(f"Server on port {port} not ready after {timeout}s")
-
-
-def stop_server(proc: subprocess.Popen):
-    """Stop a server process."""
-    proc.terminate()
-    try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    logger.info("Server stopped")
-
-
-# ────────────────────────────────────────────────────────────────────
-# Benchmark runner
-# ────────────────────────────────────────────────────────────────────
-
-def run_bench_serving(
-    config: ExperimentConfig,
-    port: int = 30000,
-) -> str:
-    """Run sglang.bench_serving and return raw output."""
-
-    cmd = [
-        sys.executable, "-m", "sglang.bench_serving",
-        "--backend", "sglang",
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "--num-prompts", str(config.num_prompts),
-    ]
-
-    if config.dataset == "sharegpt":
-        cmd.extend(["--dataset-name", "sharegpt"])
-    elif config.dataset == "random":
-        cmd.extend(["--dataset-name", "random"])
-        if config.random_input_len:
-            cmd.extend(["--random-input", str(config.random_input_len)])
-        if config.random_output_len:
-            cmd.extend(["--random-output", str(config.random_output_len)])
-
-    logger.info(f"Running benchmark: {' '.join(cmd)}")
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-
-    output = result.stdout + result.stderr
-    logger.info(f"Benchmark output:\n{output[-500:]}")
-
-    return output
-
-
-def parse_bench_output(raw_output: str) -> Dict[str, float]:
-    """Parse sglang.bench_serving output for key metrics."""
-    metrics = {}
-
-    for line in raw_output.split("\n"):
-        line = line.strip()
-
-        # Request throughput
-        if "request throughput" in line.lower():
-            try:
-                val = float(line.split(":")[-1].strip().split()[0])
-                metrics["request_throughput"] = val
-            except (ValueError, IndexError):
-                pass
-
-        # Input throughput
-        if "input token throughput" in line.lower() or (
-            "input throughput" in line.lower() and "token" in line.lower()
-        ):
-            try:
-                val = float(line.split(":")[-1].strip().split()[0])
-                metrics["input_throughput"] = val
-            except (ValueError, IndexError):
-                pass
-
-        # Output throughput
-        if "output token throughput" in line.lower() or (
-            "output throughput" in line.lower() and "token" in line.lower()
-        ):
-            try:
-                val = float(line.split(":")[-1].strip().split()[0])
-                metrics["output_throughput"] = val
-            except (ValueError, IndexError):
-                pass
-
-        # TTFT
-        if "ttft" in line.lower() or "time to first token" in line.lower():
-            if "avg" in line.lower() or "mean" in line.lower():
-                try:
-                    val = float(line.split(":")[-1].strip().split()[0])
-                    metrics["ttft_avg_ms"] = val * 1000 if val < 10 else val
-                except (ValueError, IndexError):
-                    pass
-            if "p50" in line.lower() or "median" in line.lower():
-                try:
-                    val = float(line.split(":")[-1].strip().split()[0])
-                    metrics["ttft_p50_ms"] = val * 1000 if val < 10 else val
-                except (ValueError, IndexError):
-                    pass
-            if "p99" in line.lower():
-                try:
-                    val = float(line.split(":")[-1].strip().split()[0])
-                    metrics["ttft_p99_ms"] = val * 1000 if val < 10 else val
-                except (ValueError, IndexError):
-                    pass
-
-        # Total time
-        if "total time" in line.lower() or "duration" in line.lower():
-            try:
-                val = float(line.split(":")[-1].strip().split()[0])
-                metrics["total_time_s"] = val
-            except (ValueError, IndexError):
-                pass
-
-    return metrics
-
-
-def get_server_cache_metrics(port: int = 30000) -> Dict[str, Any]:
-    """Get cache metrics from running server."""
-    import requests
-
-    try:
-        resp = requests.get(f"http://localhost:{port}/get_server_info", timeout=5)
-        info = resp.json()
-        return {
-            k: v
-            for k, v in info.items()
-            if "cache" in k.lower() or "evict" in k.lower() or "prefix" in k.lower()
-        }
-    except Exception as e:
-        logger.warning(f"Could not get server metrics: {e}")
-        return {}
-
-
-# ────────────────────────────────────────────────────────────────────
-# Experiment runner
-# ────────────────────────────────────────────────────────────────────
-
-def run_experiment(
-    config: ExperimentConfig,
-    results_dir: str = "benchmark_results",
-    port: int = 30000,
-) -> Dict[str, ExperimentResult]:
-    """Run a single experiment: baseline + patched."""
-
-    os.makedirs(results_dir, exist_ok=True)
-    results = {}
-
-    for mode in ["baseline", "patched"]:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Experiment: {config.name} | Mode: {mode}")
-        logger.info(f"Description: {config.description}")
-        logger.info(f"{'='*60}")
-
-        is_patched = mode == "patched"
-
-        # Start server
-        log_file = f"{results_dir}/{config.name}_{mode}_server.log"
-        try:
-            proc = start_server(config, port=port, patched=is_patched, log_file=log_file)
-        except TimeoutError:
-            logger.error(f"Server failed to start for {config.name}/{mode}")
-            continue
-
-        try:
-            # Warmup
-            logger.info("Warmup run...")
-            warmup_config = ExperimentConfig(
-                name="warmup",
-                description="warmup",
-                dataset=config.dataset,
-                num_prompts=min(50, config.num_prompts),
-                random_input_len=config.random_input_len,
-                random_output_len=config.random_output_len,
-            )
-            run_bench_serving(warmup_config, port=port)
-            time.sleep(2)
-
-            # Actual benchmark
-            logger.info("Benchmark run...")
-            raw_output = run_bench_serving(config, port=port)
-
-            # Get metrics
-            perf_metrics = parse_bench_output(raw_output)
-            cache_metrics = get_server_cache_metrics(port)
-
-            result = ExperimentResult(
-                config=asdict(config) if hasattr(config, "__dataclass_fields__") else vars(config),
-                mode=mode,
-                total_time_s=perf_metrics.get("total_time_s", 0),
-                request_throughput=perf_metrics.get("request_throughput", 0),
-                input_throughput=perf_metrics.get("input_throughput", 0),
-                output_throughput=perf_metrics.get("output_throughput", 0),
-                ttft_avg_ms=perf_metrics.get("ttft_avg_ms", 0),
-                ttft_p50_ms=perf_metrics.get("ttft_p50_ms", 0),
-                ttft_p99_ms=perf_metrics.get("ttft_p99_ms", 0),
-                prefix_cache_hit_rate=cache_metrics.get("prefix_cache_hit_rate", 0),
-                num_evictions=cache_metrics.get("num_evictions", 0),
-                cache_tokens_used=cache_metrics.get("cache_tokens_used", 0),
-                raw_output=raw_output,
-            )
-
-            results[mode] = result
-
-            # Save individual result
-            result_file = f"{results_dir}/{config.name}_{mode}.json"
-            with open(result_file, "w") as f:
-                # Don't serialize raw_output in JSON (too large)
-                save_data = {k: v for k, v in vars(result).items() if k != "raw_output"}
-                json.dump(save_data, f, indent=2, default=str)
-
-        finally:
-            stop_server(proc)
-            time.sleep(5)
-
-    return results
-
-
-# ────────────────────────────────────────────────────────────────────
-# Report generation
-# ────────────────────────────────────────────────────────────────────
-
-def generate_report(
-    results_dir: str = "benchmark_results",
-    output_file: Optional[str] = None,
-):
-    """Generate a comparison report from saved results."""
-
-    experiments = {}
-
-    for f in Path(results_dir).glob("*.json"):
-        if f.name.endswith("_report.json"):
-            continue
-        with open(f) as fh:
-            data = json.load(fh)
-
-        # Extract experiment name and mode from filename
-        parts = f.stem.rsplit("_", 1)
-        if len(parts) == 2:
-            exp_name, mode = parts
-            if exp_name not in experiments:
-                experiments[exp_name] = {}
-            experiments[exp_name][mode] = data
-
-    if not experiments:
-        logger.warning("No results found in %s", results_dir)
-        return
-
-    # Build report
-    report_lines = []
-    report_lines.append("=" * 80)
-    report_lines.append("MLA-aware RadixAttention — End-to-End Benchmark Report")
-    report_lines.append("=" * 80)
-    report_lines.append("")
-
-    summary_data = []
-
-    for exp_name, modes in sorted(experiments.items()):
-        report_lines.append(f"\n{'─'*80}")
-        report_lines.append(f"Experiment: {exp_name}")
-
-        if "baseline" in modes:
-            desc = modes["baseline"].get("config", {}).get("description", "")
-            report_lines.append(f"Description: {desc}")
-
-        report_lines.append(f"{'─'*80}")
-
-        baseline = modes.get("baseline", {})
-        patched = modes.get("patched", {})
-
-        if baseline and patched:
-            # Comparison table
-            metrics = [
-                ("Request throughput (req/s)", "request_throughput", "{:.2f}"),
-                ("Input throughput (tok/s)", "input_throughput", "{:.0f}"),
-                ("Output throughput (tok/s)", "output_throughput", "{:.0f}"),
-                ("TTFT avg (ms)", "ttft_avg_ms", "{:.1f}"),
-                ("TTFT P50 (ms)", "ttft_p50_ms", "{:.1f}"),
-                ("TTFT P99 (ms)", "ttft_p99_ms", "{:.1f}"),
-                ("Prefix cache hit rate", "prefix_cache_hit_rate", "{:.3f}"),
-                ("Evictions", "num_evictions", "{:d}"),
-            ]
-
-            report_lines.append(
-                f"  {'Metric':<35} {'Baseline':>12} {'Patched':>12} {'Δ':>10}"
-            )
-            report_lines.append(f"  {'─'*70}")
-
-            row = {"experiment": exp_name}
-            for label, key, fmt in metrics:
-                b_val = baseline.get(key, 0)
-                p_val = patched.get(key, 0)
-
-                b_str = fmt.format(b_val) if b_val else "N/A"
-                p_str = fmt.format(p_val) if p_val else "N/A"
-
-                if isinstance(b_val, (int, float)) and isinstance(p_val, (int, float)) and b_val:
-                    if "throughput" in key:
-                        delta = ((p_val - b_val) / b_val) * 100
-                        d_str = f"{delta:+.1f}%"
-                    elif "ttft" in key or "tpot" in key:
-                        delta = ((p_val - b_val) / b_val) * 100
-                        d_str = f"{delta:+.1f}%"
-                    elif "eviction" in key:
-                        delta = p_val - b_val
-                        d_str = f"{delta:+d}"
-                    else:
-                        delta = p_val - b_val
-                        d_str = f"{delta:+.3f}"
-                else:
-                    d_str = "N/A"
-
-                report_lines.append(
-                    f"  {label:<35} {b_str:>12} {p_str:>12} {d_str:>10}"
-                )
-                row[key] = {"baseline": b_val, "patched": p_val}
-
-            summary_data.append(row)
-        else:
-            for mode, data in modes.items():
-                report_lines.append(f"\n  {mode.upper()}:")
-                for k, v in data.items():
-                    if k not in ("config", "raw_output"):
-                        report_lines.append(f"    {k}: {v}")
-
-    report_lines.append(f"\n{'='*80}")
-    report_lines.append("END OF REPORT")
-    report_lines.append(f"{'='*80}")
-
-    report_text = "\n".join(report_lines)
-    print(report_text)
-
-    # Save
-    if output_file is None:
-        output_file = f"{results_dir}/benchmark_report.txt"
-    with open(output_file, "w") as f:
-        f.write(report_text)
-
-    # Also save structured summary
-    with open(f"{results_dir}/benchmark_summary.json", "w") as f:
-        json.dump(summary_data, f, indent=2)
-
-    logger.info(f"Report saved to {output_file}")
-
-
-# ────────────────────────────────────────────────────────────────────
-# All-in-one runner (no server — uses Engine API directly)
-# ────────────────────────────────────────────────────────────────────
-
-def run_engine_benchmark(
-    model_path: str = "deepseek-ai/DeepSeek-V2-Lite",
-    tp_size: int = 1,
-    results_dir: str = "benchmark_results",
-    num_prompts: int = 200,
-    mem_fraction_static: float = 0.88,
-):
-    """Run benchmark in-process using SGLang Engine API.
-
-    This is simpler than the server-based approach — no need to manage
-    processes. But it doesn't use bench_serving's full workload generator.
+def apply_mla_patch_safe():
     """
-    os.makedirs(results_dir, exist_ok=True)
+    Minimal MLA-aware eviction patch that does NOT call available_size().
+
+    The original patch in gpu_validation.py calls
+    allocator.available_size() inside patched_evict(), which acquires
+    a lock that is already held by the scheduler → deadlock.
+
+    This version only uses information already available on the RadixCache
+    object itself (evictable_size_, pool size from init), never touching
+    the allocator during eviction.
+    """
+    sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+    try:
+        from mla_radix_cache import MLAModelConfig, MLAEvictionBudget
+    except ImportError:
+        logger.error("Cannot import mla_radix_cache from src/. Check path.")
+        return False
+
+    try:
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+    except ImportError:
+        logger.error("Cannot import SGLang RadixCache.")
+        return False
+
+    # Use DeepSeek-V2-Lite defaults
+    mla_config = MLAModelConfig.deepseek_v2_lite()
+    # compression_ratio ≈ 14x, target_free_ratio ≈ 0.014
+    target_free_ratio = max(0.05, 0.20 / mla_config.compression_ratio)
+
+    original_evict = RadixCache.evict
+
+    def patched_evict(self, num_tokens):
+        if getattr(self, "disable", False):
+            return original_evict(self, num_tokens)
+
+        # Use only RadixCache-internal state — no allocator call
+        evictable = getattr(self, "evictable_size_", 0)
+        protected = getattr(self, "protected_size_", 0)
+        total_cached = evictable + protected
+
+        # Estimate free slots from max_total_num_tokens if available
+        # (set by SGLang scheduler on the cache object)
+        pool_total = getattr(self, "_mla_pool_total", None)
+        if pool_total is None:
+            # Try to infer from allocator without calling available_size()
+            alloc = getattr(self, "token_to_kv_pool_allocator", None)
+            if alloc is not None:
+                pool_total = getattr(alloc, "size", None) or getattr(alloc, "total_size", None)
+            if pool_total is None:
+                pool_total = total_cached + num_tokens  # conservative fallback
+            self._mla_pool_total = pool_total
+
+        free_estimate = max(0, pool_total - total_cached)
+        total = total_cached + free_estimate
+        free_ratio = free_estimate / max(1, total)
+
+        if free_ratio > target_free_ratio:
+            # Plenty of space — reduce eviction count
+            scale = max(0.1, 1.0 - (free_ratio - target_free_ratio))
+            adjusted = max(1, int(num_tokens * scale))
+            logger.debug(
+                f"MLA evict: requested={num_tokens} → adjusted={adjusted} "
+                f"(free_ratio={free_ratio:.3f} > target={target_free_ratio:.3f})"
+            )
+            return original_evict(self, adjusted)
+
+        return original_evict(self, num_tokens)
+
+    RadixCache.evict = patched_evict
+    logger.info(
+        f"MLA eviction patch applied (safe, no allocator call). "
+        f"compression_ratio={mla_config.compression_ratio:.1f}x  "
+        f"target_free_ratio={target_free_ratio:.4f}"
+    )
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────
+# Prompt builder
+# ─────────────────────────────────────────────────────────────────
+
+def build_prompts(num_prompts: int, num_system_prompts: int, system_prompt_tokens: int):
+    TOPICS = [
+        "mathematics", "physics", "chemistry", "biology", "history",
+        "geography", "literature", "philosophy", "economics", "computer science",
+        "medicine", "law", "engineering", "astronomy", "psychology",
+        "linguistics", "art", "music", "architecture", "sociology",
+        "neuroscience", "climatology", "robotics", "cryptography", "genetics",
+    ]
+    ROLES = ["expert", "professor", "researcher", "analyst", "specialist",
+             "consultant", "advisor", "tutor", "mentor", "scientist"]
+    STYLES = ["concise and precise", "detailed and thorough", "simple and clear",
+              "technical and rigorous", "friendly and approachable"]
+
+    words_needed = int(system_prompt_tokens / 1.3)
+
+    def make_system_prompt(seed: int) -> str:
+        topic = TOPICS[seed % len(TOPICS)]
+        role = ROLES[seed % len(ROLES)]
+        style = STYLES[seed % len(STYLES)]
+        filler = (
+            f"You are an expert {role} specialising in {topic}. "
+            f"Your communication style is {style}. "
+            f"Always provide accurate, well-reasoned responses based on current knowledge. "
+            f"When discussing {topic}, draw on your deep expertise and provide examples. "
+            f"Support claims with evidence. Flag uncertainty explicitly. "
+            f"Prioritise correctness and clarity over brevity. "
+            f"You have studied {topic} for over two decades at leading institutions. "
+            f"Your answers should reflect the state of the art in {topic}. "
+        )
+        repeat = max(1, words_needed // len(filler.split()) + 1)
+        words = (filler * repeat).split()[:words_needed]
+        return " ".join(words) + f" [SYS={seed:04d}]"
+
+    system_prompts = [make_system_prompt(i) for i in range(num_system_prompts)]
+
+    QUESTIONS = [
+        "What is the capital of France?",
+        "What is 17 multiplied by 23?",
+        "Explain photosynthesis in one sentence.",
+        "What is the speed of light in m/s?",
+        "Who wrote Hamlet?",
+        "What is the boiling point of water in Celsius?",
+        "Name three planets in our solar system.",
+        "What does CPU stand for?",
+        "What is the square root of 144?",
+        "In what year did World War II end?",
+        "What is the chemical symbol for gold?",
+        "How many bones are in the human body?",
+        "What is the powerhouse of the cell?",
+        "Who painted the Mona Lisa?",
+        "What is the largest ocean on Earth?",
+    ]
+
+    n_shared = num_prompts * 3 // 4
+    shared_prompts = [
+        f"{system_prompts[i % num_system_prompts]}\n\n"
+        f"User: {QUESTIONS[i % len(QUESTIONS)]} (req {i})\nAssistant:"
+        for i in range(n_shared)
+    ]
+    n_unique = num_prompts - n_shared
+    unique_prompts = [
+        f"StandaloneQuery_{i*137}: Define entropy in thermodynamics briefly.\n"
+        for i in range(n_unique)
+    ]
+
+    all_prompts = shared_prompts + unique_prompts
+    shared_set = set(range(len(shared_prompts)))
+
+    bytes_per_token = 576 * 2 * 27
+    cache_demand_gb = (num_system_prompts * system_prompt_tokens * bytes_per_token) / (1024**3)
+    logger.info(
+        f"Workload: {len(shared_prompts)} shared + {len(unique_prompts)} unique | "
+        f"{num_system_prompts} sys_prompts × ~{system_prompt_tokens} tok "
+        f"= ~{cache_demand_gb:.2f} GB cache demand"
+    )
+    return all_prompts, shared_set, cache_demand_gb
+
+
+# ─────────────────────────────────────────────────────────────────
+# Single-mode runner
+# ─────────────────────────────────────────────────────────────────
+
+def run_single_mode(
+    mode: str,
+    model_path: str,
+    num_prompts: int,
+    mem_fraction: float,
+    results_dir: str,
+    num_system_prompts: int = 20,
+    system_prompt_tokens: int = 800,
+    max_new_tokens: int = 32,
+):
+    import asyncio
 
     try:
         from sglang import Engine
     except ImportError:
-        logger.error("SGLang not installed. Install with: pip install 'sglang[all]'")
-        return
+        logger.error("SGLang not installed.")
+        sys.exit(1)
 
-    from mla_radix_cache import MLAModelConfig
+    logger.info(f"{'='*60}")
+    logger.info(f"Mode: {mode.upper()}  mem={mem_fraction}  prompts={num_prompts}  sys={num_system_prompts}")
+    logger.info(f"{'='*60}")
 
-    # Generate synthetic workload: shared prefix + unique suffix
-    SYSTEM = (
-        "You are a helpful assistant. Answer questions accurately. "
-        "If unsure, say so. Keep answers concise. " * 10  # ~100 tokens
+    all_prompts, shared_set, cache_demand_gb = build_prompts(
+        num_prompts, num_system_prompts, system_prompt_tokens
     )
 
-    prompts = []
-    for i in range(num_prompts):
-        prompts.append(f"{SYSTEM}\n\nQuestion {i}: What is {i} times {i+1}?\nAnswer:")
+    # Apply patch BEFORE Engine init so RadixCache class is patched
+    # before any instance is created
+    if mode == "patched":
+        ok = apply_mla_patch_safe()
+        if not ok:
+            logger.error("Patch failed, aborting patched run.")
+            sys.exit(1)
 
-    for mode in ["baseline", "patched"]:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Engine benchmark — {mode}")
-        logger.info(f"{'='*60}")
+    logger.info("Initialising SGLang Engine...")
+    engine = Engine(
+        model_path=model_path,
+        tp_size=1,
+        trust_remote_code=True,
+        mem_fraction_static=mem_fraction,
+    )
+    logger.info("Engine ready.")
 
-        engine = Engine(
-            model_path=model_path,
-            tp_size=tp_size,
-            trust_remote_code=True,
-            mem_fraction_static=mem_fraction_static,
+    # Fix event loop destroyed by Engine.__init__
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    import sglang.srt.entrypoints.engine as _eng_mod
+    _eng_mod.asyncio.get_event_loop = lambda: _loop
+    logger.info("Event loop restored.")
+
+    # Warmup
+    logger.info("Warmup...")
+    for p in all_prompts[:10]:
+        engine.generate(p, sampling_params={"max_new_tokens": 16, "temperature": 0})
+    logger.info("Warmup done.")
+
+    # Benchmark
+    logger.info(f"Benchmarking {len(all_prompts)} prompts...")
+    ttfts_shared, ttfts_unique = [], []
+    total_prompt_tokens = 0
+    total_cached_tokens = 0
+    start_total = time.perf_counter()
+
+    for idx, prompt in enumerate(all_prompts):
+        t0 = time.perf_counter()
+        out = engine.generate(
+            prompt,
+            sampling_params={"max_new_tokens": max_new_tokens, "temperature": 0},
         )
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        if mode == "patched":
-            from gpu_validation import apply_mla_eviction_patch
-            apply_mla_eviction_patch(engine)
+        meta = out.get("meta_info", {})
+        total_prompt_tokens += meta.get("prompt_tokens", 0)
+        total_cached_tokens += meta.get("cached_tokens", 0)
 
-        # Warmup
-        for p in prompts[:10]:
-            engine.generate(p, sampling_params={"max_new_tokens": 16, "temperature": 0})
+        if idx in shared_set:
+            ttfts_shared.append(elapsed_ms)
+        else:
+            ttfts_unique.append(elapsed_ms)
 
-        # Benchmark
-        ttfts = []
-        start_total = time.perf_counter()
+        if (idx + 1) % 50 == 0:
+            hit = total_cached_tokens / max(1, total_prompt_tokens)
+            logger.info(f"  {idx+1}/{len(all_prompts)} | cache_hit={hit:.3f}")
 
-        for p in prompts:
-            t0 = time.perf_counter()
-            output = engine.generate(
-                p, sampling_params={"max_new_tokens": 32, "temperature": 0}
-            )
-            t1 = time.perf_counter()
-            ttfts.append((t1 - t0) * 1000)
+    total_time = time.perf_counter() - start_total
+    cache_hit_rate = total_cached_tokens / max(1, total_prompt_tokens)
+    logger.info(f"cache_hit={cache_hit_rate:.4f} ({total_cached_tokens}/{total_prompt_tokens})")
 
-        total_time = time.perf_counter() - start_total
+    engine.shutdown()
+    logger.info("Engine shut down.")
 
-        # Get server info if available
-        try:
-            info = engine.get_server_info()
-        except Exception:
-            info = {}
+    def pct(lst, p):
+        if not lst:
+            return 0.0
+        s = sorted(lst)
+        return s[min(int(len(s) * p / 100), len(s) - 1)]
 
-        engine.shutdown()
+    all_ttfts = ttfts_shared + ttfts_unique
+    result = {
+        "mode": mode,
+        "model": model_path,
+        "num_prompts": len(all_prompts),
+        "num_system_prompts": num_system_prompts,
+        "system_prompt_tokens": system_prompt_tokens,
+        "cache_demand_gb": round(cache_demand_gb, 3),
+        "mem_fraction": mem_fraction,
+        "total_time_s": round(total_time, 3),
+        "throughput_req_s": round(len(all_prompts) / total_time, 3),
+        "ttft_avg_ms": round(statistics.mean(all_ttfts), 2),
+        "ttft_p50_ms": round(pct(all_ttfts, 50), 2),
+        "ttft_p95_ms": round(pct(all_ttfts, 95), 2),
+        "ttft_p99_ms": round(pct(all_ttfts, 99), 2),
+        "ttft_shared_avg_ms": round(statistics.mean(ttfts_shared), 2) if ttfts_shared else 0,
+        "ttft_shared_p50_ms": round(pct(ttfts_shared, 50), 2),
+        "ttft_shared_p99_ms": round(pct(ttfts_shared, 99), 2),
+        "ttft_unique_avg_ms": round(statistics.mean(ttfts_unique), 2) if ttfts_unique else 0,
+        "ttft_unique_p99_ms": round(pct(ttfts_unique, 99), 2),
+        "cache_hit_rate": round(cache_hit_rate, 4),
+        "total_cached_tokens": total_cached_tokens,
+        "total_prompt_tokens": total_prompt_tokens,
+    }
 
-        # Compute metrics
-        import statistics
+    os.makedirs(results_dir, exist_ok=True)
+    out_file = os.path.join(results_dir, f"{mode}.json")
+    with open(out_file, "w") as f:
+        json.dump(result, f, indent=2)
 
-        avg_ttft = statistics.mean(ttfts)
-        p50_ttft = statistics.median(ttfts)
-        sorted_ttfts = sorted(ttfts)
-        p99_idx = int(len(sorted_ttfts) * 0.99)
-        p99_ttft = sorted_ttfts[min(p99_idx, len(sorted_ttfts) - 1)]
-
-        result = {
-            "mode": mode,
-            "model": model_path,
-            "num_prompts": num_prompts,
-            "total_time_s": total_time,
-            "request_throughput": num_prompts / total_time,
-            "ttft_avg_ms": avg_ttft,
-            "ttft_p50_ms": p50_ttft,
-            "ttft_p99_ms": p99_ttft,
-            "server_info": {
-                k: v for k, v in info.items()
-                if "cache" in str(k).lower() or "evict" in str(k).lower()
-            },
-        }
-
-        logger.info(f"Results:")
-        logger.info(f"  Throughput: {result['request_throughput']:.2f} req/s")
-        logger.info(f"  TTFT avg: {avg_ttft:.1f} ms")
-        logger.info(f"  TTFT P50: {p50_ttft:.1f} ms")
-        logger.info(f"  TTFT P99: {p99_ttft:.1f} ms")
-
-        with open(f"{results_dir}/engine_{mode}.json", "w") as f:
-            json.dump(result, f, indent=2, default=str)
-
-        time.sleep(5)
-
-    # Generate comparison
-    _compare_engine_results(results_dir)
+    logger.info(f"Saved → {out_file}")
+    logger.info(f"Throughput={result['throughput_req_s']:.2f} req/s  "
+                f"TTFT={result['ttft_avg_ms']:.1f}ms  cache_hit={cache_hit_rate:.4f}")
 
 
-def _compare_engine_results(results_dir: str):
-    """Compare baseline vs patched engine results."""
-    try:
-        with open(f"{results_dir}/engine_baseline.json") as f:
-            baseline = json.load(f)
-        with open(f"{results_dir}/engine_patched.json") as f:
-            patched = json.load(f)
-    except FileNotFoundError:
-        logger.warning("Missing engine result files")
+# ─────────────────────────────────────────────────────────────────
+# Comparison printer
+# ─────────────────────────────────────────────────────────────────
+
+def compare_results(results_dir: str):
+    b_file = os.path.join(results_dir, "baseline.json")
+    p_file = os.path.join(results_dir, "patched.json")
+
+    if not os.path.exists(b_file) or not os.path.exists(p_file):
+        logger.error(f"Missing files in {results_dir}/")
         return
 
-    print("\n" + "=" * 70)
-    print("Engine Benchmark Comparison")
-    print("=" * 70)
+    with open(b_file) as f:
+        b = json.load(f)
+    with open(p_file) as f:
+        p = json.load(f)
 
-    metrics = [
-        ("Throughput (req/s)", "request_throughput"),
-        ("TTFT avg (ms)", "ttft_avg_ms"),
-        ("TTFT P50 (ms)", "ttft_p50_ms"),
-        ("TTFT P99 (ms)", "ttft_p99_ms"),
-        ("Total time (s)", "total_time_s"),
+    def row(label, key, fmt="{:.2f}", higher_is_better=True):
+        bv = b.get(key, 0)
+        pv = p.get(key, 0)
+        if bv == 0:
+            print(f"  {label:<38} {'N/A':>10} {fmt.format(pv):>10} {'N/A':>9}    ~")
+            return
+        delta = (pv - bv) / bv * 100
+        d_str = f"{delta:+.1f}%"
+        sym = ("✓" if delta > 1 else ("✗" if delta < -1 else "~")) if higher_is_better \
+              else ("✓" if delta < -1 else ("✗" if delta > 1 else "~"))
+        print(f"  {label:<38} {fmt.format(bv):>10} {fmt.format(pv):>10} {d_str:>9}    {sym}")
+
+    w = 78
+    print("=" * w)
+    print("  Engine Benchmark — MLA-aware RadixAttention")
+    print(f"  Model: {b.get('model','?')}")
+    print(f"  Prompts: {b.get('num_prompts')}  mem: {b.get('mem_fraction')}  "
+          f"sys_prompts: {b.get('num_system_prompts')}  "
+          f"cache_demand: {b.get('cache_demand_gb','?')} GB")
+    print("=" * w)
+    print(f"  {'Metric':<38} {'Baseline':>10} {'Patched':>10} {'Change':>9}")
+    print(f"  {'─'*w}")
+    row("Throughput (req/s)",           "throughput_req_s",   "{:.2f}", True)
+    print("  ── Overall ──────────────────────────")
+    row("TTFT avg (ms)",                "ttft_avg_ms",        "{:.2f}", False)
+    row("TTFT P50 (ms)",                "ttft_p50_ms",        "{:.2f}", False)
+    row("TTFT P95 (ms)",                "ttft_p95_ms",        "{:.2f}", False)
+    row("TTFT P99 (ms)",                "ttft_p99_ms",        "{:.2f}", False)
+    print("  ── Shared-prefix (primary target) ───")
+    row("TTFT shared avg (ms) ★",      "ttft_shared_avg_ms", "{:.2f}", False)
+    row("TTFT shared P50 (ms)",         "ttft_shared_p50_ms", "{:.2f}", False)
+    row("TTFT shared P99 (ms)",         "ttft_shared_p99_ms", "{:.2f}", False)
+    print("  ── Unique requests (regression) ─────")
+    row("TTFT unique avg (ms)",         "ttft_unique_avg_ms", "{:.2f}", False)
+    row("TTFT unique P99 (ms)",         "ttft_unique_p99_ms", "{:.2f}", False)
+    print("  ── Cache ────────────────────────────")
+    row("Cache hit rate ★",             "cache_hit_rate",     "{:.4f}", True)
+    row("Total time (s)",               "total_time_s",       "{:.2f}", False)
+
+    b_hit = b.get("cache_hit_rate", 0)
+    p_hit = p.get("cache_hit_rate", 0)
+    demand = b.get("cache_demand_gb", 0)
+    print("=" * w)
+    print(f"  cache_hit: baseline={b_hit:.4f}  patched={p_hit:.4f}  "
+          f"cache_demand={demand:.2f}GB")
+    if abs(b_hit - p_hit) < 0.005:
+        print("  → No eviction triggered. Increase --num-system-prompts.")
+    elif p_hit > b_hit:
+        print("  → Patch working: patched kept more prefixes cached ✓")
+    else:
+        print("  → Patch may be too aggressive (patched hit rate lower).")
+    print("=" * w)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Subprocess orchestrator
+# ─────────────────────────────────────────────────────────────────
+
+def run_via_subprocess(mode, model, num_prompts, mem_fraction, results_dir,
+                       cuda_devices, num_system_prompts, system_prompt_tokens):
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = cuda_devices
+    cmd = [
+        sys.executable, __file__,
+        "--run-mode", mode,
+        "--model", model,
+        "--num-prompts", str(num_prompts),
+        "--mem-fraction", str(mem_fraction),
+        "--num-system-prompts", str(num_system_prompts),
+        "--system-prompt-tokens", str(system_prompt_tokens),
+        "--results-dir", results_dir,
     ]
-
-    print(f"  {'Metric':<30} {'Baseline':>12} {'Patched':>12} {'Change':>10}")
-    print(f"  {'─'*65}")
-
-    for label, key in metrics:
-        b = baseline.get(key, 0)
-        p = patched.get(key, 0)
-        if b > 0:
-            delta = ((p - b) / b) * 100
-            print(f"  {label:<30} {b:>11.2f} {p:>11.2f} {delta:>+9.1f}%")
-        else:
-            print(f"  {label:<30} {b:>11.2f} {p:>11.2f} {'N/A':>10}")
-
-    print("=" * 70)
+    logger.info(f"Spawning [{mode}]")
+    start = time.time()
+    proc = subprocess.Popen(cmd, env=env)
+    proc.wait()
+    elapsed = time.time() - start
+    if proc.returncode != 0:
+        logger.error(f"[{mode}] failed (code {proc.returncode})")
+        return False
+    logger.info(f"[{mode}] done in {elapsed/60:.1f} min")
+    return True
 
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 # Main
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Phase 4: End-to-End Benchmark for MLA-aware RadixAttention"
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["server", "engine", "report"],
-        default="engine",
-        help=(
-            "server: start/stop SGLang servers and use bench_serving; "
-            "engine: in-process benchmark using Engine API; "
-            "report: generate comparison report from saved results"
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        default="deepseek-ai/DeepSeek-V2-Lite",
-        help="Model path",
-    )
-    parser.add_argument("--tp", type=int, default=1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V2-Lite")
     parser.add_argument("--num-prompts", type=int, default=200)
-    parser.add_argument("--mem-fraction", type=float, default=0.88,
-                        help="mem_fraction_static for Engine (lower = smaller KV pool = more eviction pressure)")
-    parser.add_argument(
-        "--experiment",
-        choices=list(EXPERIMENTS.keys()) + ["all"],
-        default="all",
-        help="Which experiment to run (server mode only)",
-    )
-    parser.add_argument("--results-dir", default="benchmark_results")
-    parser.add_argument("--port", type=int, default=30000)
-
+    parser.add_argument("--mem-fraction", type=float, default=0.85)
+    parser.add_argument("--num-system-prompts", type=int, default=20,
+                        help="Distinct system prompts. Controls cache pressure. "
+                             "Try 150 for H100 80GB with mem=0.85.")
+    parser.add_argument("--system-prompt-tokens", type=int, default=800,
+                        help="Approx tokens per system prompt (shorter = faster runs)")
+    parser.add_argument("--results-dir", default=RESULTS_DIR)
+    parser.add_argument("--cuda-devices", default="0")
+    parser.add_argument("--compare-only", action="store_true")
+    parser.add_argument("--run-mode", choices=["baseline", "patched"])
     args = parser.parse_args()
 
-    # Python 3.10+ requires an explicit event loop for sglang Engine
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    if args.mem_fraction < MIN_SAFE_MEM_FRACTION and args.run_mode is None:
+        logger.warning(f"mem-fraction {args.mem_fraction} < safe min {MIN_SAFE_MEM_FRACTION}")
+        if input("Continue? [y/N] ").strip().lower() != "y":
+            sys.exit(0)
 
-    if args.mode == "report":
-        generate_report(results_dir=args.results_dir)
-
-    elif args.mode == "engine":
-        run_engine_benchmark(
+    if args.run_mode:
+        run_single_mode(
+            mode=args.run_mode,
             model_path=args.model,
-            tp_size=args.tp,
-            results_dir=args.results_dir,
             num_prompts=args.num_prompts,
-            mem_fraction_static=args.mem_fraction,
+            mem_fraction=args.mem_fraction,
+            results_dir=args.results_dir,
+            num_system_prompts=args.num_system_prompts,
+            system_prompt_tokens=args.system_prompt_tokens,
         )
+        return
 
-    elif args.mode == "server":
-        exp_names = list(EXPERIMENTS.keys()) if args.experiment == "all" else [args.experiment]
+    if args.compare_only:
+        compare_results(args.results_dir)
+        return
 
-        for exp_name in exp_names:
-            config = EXPERIMENTS[exp_name]
-            config.model = args.model
-            config.tp_size = args.tp
+    os.makedirs(args.results_dir, exist_ok=True)
+    cuda = os.environ.get("CUDA_VISIBLE_DEVICES", args.cuda_devices)
 
-            try:
-                run_experiment(config, results_dir=args.results_dir, port=args.port)
-            except Exception as e:
-                logger.error(f"Experiment {exp_name} failed: {e}", exc_info=True)
+    for mode in ["baseline", "patched"]:
+        ok = run_via_subprocess(
+            mode=mode, model=args.model, num_prompts=args.num_prompts,
+            mem_fraction=args.mem_fraction, results_dir=args.results_dir,
+            cuda_devices=cuda, num_system_prompts=args.num_system_prompts,
+            system_prompt_tokens=args.system_prompt_tokens,
+        )
+        if not ok:
+            logger.error(f"Aborting after [{mode}] failure.")
+            sys.exit(1)
+        logger.info("Waiting 15s for GPU memory to release...")
+        time.sleep(15)
 
-        # Generate final report
-        generate_report(results_dir=args.results_dir)
+    compare_results(args.results_dir)
 
 
 if __name__ == "__main__":
