@@ -33,6 +33,12 @@ Each MLA token stores a **576-dim compressed latent** — not the 40,960-dim ful
 
 This project fixes the eviction logic.
 
+Expected benefit scenario:
+- DeepSeek-V3/R1 (larger model, smaller pool ratio)
+- High concurrency (>100 concurrent requests)  
+- Long shared system prompts (>2048 tokens)
+- pool utilization consistently >80%
+
 ---
 
 ## What changes
